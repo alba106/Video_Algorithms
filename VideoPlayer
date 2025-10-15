@@ -1,0 +1,1 @@
+#This project explores video compression and visualization through a simple Python-based video player. The goal is to build a lightweight tool that allows frame-by-frame navigation and zooming, features that are especially useful for studying video data in scientific and artistic contexts.
