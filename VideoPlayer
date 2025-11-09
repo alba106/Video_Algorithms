@@ -1,1 +1,197 @@
 #This project explores video compression and visualization through a simple Python-based video player. The goal is to build a lightweight tool that allows frame-by-frame navigation and zooming, features that are especially useful for studying video data in scientific and artistic contexts.
+
+#!/usr/bin/env python3
+"""
+video_player.py — simple frame-by-frame video viewer with zoom/pan
+Dependencies:
+  pip install av PySide6 numpy pillow
+
+Run:
+  python video_player.py path/to/video.mp4
+"""
+
+import sys
+import av
+import numpy as np
+from PySide6 import QtCore, QtGui, QtWidgets
+from PIL import Image
+
+class FrameStore:
+    """Simple in-memory store of frames and metadata.
+    For production use, replace with on-demand decoding + cache."""
+    def __init__(self, path):
+        self.path = path
+        self.frames = []  # list of numpy arrays (H,W,3) dtype=uint8
+        self.meta = []    # list of dicts: {'index', 'pts', 'time', 'key_frame'}
+        self._load_all_frames()
+
+    def _load_all_frames(self):
+        container = av.open(self.path)
+        # choose first video stream
+        stream = next((s for s in container.streams if s.type == 'video'), None)
+        if stream is None:
+            raise RuntimeError("No video stream found")
+        stream.thread_type = "AUTO"
+        idx = 0
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                # Convert to RGB numpy array
+                arr = frame.to_ndarray(format='rgb24')  # shape (H,W,3)
+                # store
+                t = None
+                try:
+                    # presentation timestamp converted to seconds (if available)
+                    t = float(frame.pts * stream.time_base) if frame.pts is not None else None
+                except Exception:
+                    t = None
+                self.frames.append(arr)
+                self.meta.append({
+                    'index': idx,
+                    'pts': frame.pts,
+                    'time': t,
+                    'key_frame': getattr(frame, 'key_frame', False),
+                })
+                idx += 1
+        container.close()
+
+    def count(self):
+        return len(self.frames)
+
+    def get(self, idx):
+        return self.frames[idx], self.meta[idx]
+
+class ImageItem(QtWidgets.QGraphicsPixmapItem):
+    """A QGraphicsPixmapItem that keeps aspect ratio on resizing if needed."""
+    pass
+
+class ZoomableView(QtWidgets.QGraphicsView):
+    """QGraphicsView with mouse-wheel zoom and drag-to-pan."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+        self._zoom = 0
+
+    def wheelEvent(self, event: QtGui.QWheelEvent):
+        """Zoom in/out with wheel. Keep zoom within reasonable bounds."""
+        delta = event.angleDelta().y()
+        if delta > 0:
+            zoom_factor = 1.25
+            self._zoom += 1
+        else:
+            zoom_factor = 0.8
+            self._zoom -= 1
+        # optional clamp
+        if self._zoom > 30:
+            self._zoom = 30
+            return
+        if self._zoom < -30:
+            self._zoom = -30
+            return
+        self.scale(zoom_factor, zoom_factor)
+
+class VideoPlayerWindow(QtWidgets.QMainWindow):
+    def __init__(self, videopath):
+        super().__init__()
+        self.setWindowTitle("Frame-by-frame video player")
+        self.resize(1000, 700)
+
+        # Load frames (blocking). For large files, replace with streaming decode.
+        self.store = FrameStore(videopath)
+        self.current_index = 0
+
+        # UI
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        vlayout = QtWidgets.QVBoxLayout(central)
+
+        # Graphics view
+        self.scene = QtWidgets.QGraphicsScene()
+        self.view = ZoomableView(self.scene)
+        vlayout.addWidget(self.view, 1)
+
+        # Controls
+        controls = QtWidgets.QHBoxLayout()
+        self.prev_btn = QtWidgets.QPushButton("◀ Prev")
+        self.next_btn = QtWidgets.QPushButton("Next ▶")
+        self.frame_spin = QtWidgets.QSpinBox()
+        self.frame_spin.setMaximum(max(0, self.store.count()-1))
+        self.frame_label = QtWidgets.QLabel("Frame: 0 / 0")
+        self.time_label = QtWidgets.QLabel("Time: -")
+        controls.addWidget(self.prev_btn)
+        controls.addWidget(self.next_btn)
+        controls.addWidget(QtWidgets.QLabel("Jump to:"))
+        controls.addWidget(self.frame_spin)
+        controls.addWidget(self.frame_label)
+        controls.addWidget(self.time_label)
+        controls.addStretch()
+        vlayout.addLayout(controls)
+
+        # Signals
+        self.prev_btn.clicked.connect(self.prev_frame)
+        self.next_btn.clicked.connect(self.next_frame)
+        self.frame_spin.valueChanged.connect(self.go_to_frame)
+
+        # Keyboard shortcuts
+        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self, activated=self.prev_frame)
+        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Right), self, activated=self.next_frame)
+
+        # Display first frame
+        self.pixmap_item = ImageItem()
+        self.scene.addItem(self.pixmap_item)
+        if self.store.count() > 0:
+            self.show_frame(0)
+        else:
+            self.frame_label.setText("No frames found")
+
+    def _ndarray_to_qpixmap(self, arr: np.ndarray) -> QtGui.QPixmap:
+        """Convert an HxWx3 uint8 numpy array (RGB) to QPixmap"""
+        h, w, ch = arr.shape
+        assert ch == 3
+        # Convert to bytes and QImage
+        img = QtGui.QImage(arr.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(img)
+        return pix
+
+    def show_frame(self, idx):
+        arr, m = self.store.get(idx)
+        pix = self._ndarray_to_qpixmap(arr)
+        self.pixmap_item.setPixmap(pix)
+        # fit scene to view if first time
+        if self.view.sceneRect().isNull():
+            self.scene.setSceneRect(self.pixmap_item.boundingRect())
+            self.view.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
+        self.current_index = idx
+        self.frame_spin.blockSignals(True)
+        self.frame_spin.setValue(idx)
+        self.frame_spin.blockSignals(False)
+        self.frame_label.setText(f"Frame: {idx} / {self.store.count()-1}")
+        t = m.get('time', None)
+        self.time_label.setText(f"Time: {t:.3f}s" if t is not None else "Time: -")
+
+    def prev_frame(self):
+        if self.current_index > 0:
+            self.show_frame(self.current_index - 1)
+
+    def next_frame(self):
+        if self.current_index < self.store.count() - 1:
+            self.show_frame(self.current_index + 1)
+
+    def go_to_frame(self, val):
+        self.show_frame(val)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python video_player.py path/to/video")
+        sys.exit(1)
+    video_path = sys.argv[1]
+    app = QtWidgets.QApplication(sys.argv)
+    win = VideoPlayerWindow(video_path)
+    win.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
